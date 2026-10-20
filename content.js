@@ -95,35 +95,142 @@
     }
   }
 
-  // Load saved settings & history
-  if (chrome.storage && chrome.storage.local) {
-    chrome.storage.local.get(
-      [
-        "filterQuery", "subfolder", "staggerDelayMs", "jitterMs",
-        "batchPauseEvery", "safeMode", "skipDuplicates", "requireConfirmation",
-        "downloadAsZip", "autoAdvancePages", "maxPagesToCrawl",
-        "playAudioChime", "desktopNotification",
-        "startDate", "endDate", "downloadHistory"
-      ],
-      (data) => {
-        if (data.filterQuery !== undefined) CONFIG.filterQuery = data.filterQuery;
-        if (data.subfolder) CONFIG.subfolder = cleanSubfolderName(data.subfolder);
-        if (data.staggerDelayMs) CONFIG.staggerDelayMs = Number(data.staggerDelayMs);
-        if (data.jitterMs !== undefined) CONFIG.jitterMs = Number(data.jitterMs);
-        if (typeof data.safeMode === "boolean") CONFIG.safeMode = data.safeMode;
-        if (typeof data.skipDuplicates === "boolean") CONFIG.skipDuplicates = data.skipDuplicates;
-        if (typeof data.requireConfirmation === "boolean") CONFIG.requireConfirmation = data.requireConfirmation;
-        if (typeof data.downloadAsZip === "boolean") CONFIG.downloadAsZip = data.downloadAsZip;
-        if (typeof data.autoAdvancePages === "boolean") CONFIG.autoAdvancePages = data.autoAdvancePages;
-        if (data.maxPagesToCrawl) CONFIG.maxPagesToCrawl = Number(data.maxPagesToCrawl);
-        if (typeof data.playAudioChime === "boolean") CONFIG.playAudioChime = data.playAudioChime;
-        if (typeof data.desktopNotification === "boolean") CONFIG.desktopNotification = data.desktopNotification;
-        if (data.startDate) CONFIG.startDate = data.startDate;
-        if (data.endDate) CONFIG.endDate = data.endDate;
-        if (data.downloadHistory) downloadHistoryCache = data.downloadHistory;
-        updateUI();
+  /* ==========================================================================
+     Extension Runtime Lifecycle & Context Invalidation Guard
+     ========================================================================== */
+
+  let isContextInvalidated = false;
+
+  function isExtensionValid() {
+    try {
+      return Boolean(typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function handleContextInvalidated() {
+    if (isContextInvalidated) return;
+    isContextInvalidated = true;
+    console.warn("[Gmail Downloader] Extension context was invalidated (extension reloaded/updated). Disconnecting observers.");
+    try {
+      if (typeof observer !== "undefined" && observer) {
+        observer.disconnect();
       }
-    );
+    } catch (e) {}
+    if (typeof debounceTimer !== "undefined" && debounceTimer) {
+      clearTimeout(debounceTimer);
+    }
+    showReloadPrompt();
+  }
+
+  function showReloadPrompt() {
+    if (document.getElementById("idlc-reload-prompt")) return;
+    const banner = document.createElement("div");
+    banner.id = "idlc-reload-prompt";
+    banner.innerHTML = `
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:16px;">🔄</span>
+        <span><b>Gmail Downloader updated:</b> Please reload this tab to reconnect.</span>
+      </div>
+      <button id="idlc-btn-reload-page" style="background:#1a73e8; color:#fff; border:none; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:12px; font-weight:600;">Reload Tab</button>
+      <button id="idlc-btn-dismiss-reload" style="background:transparent; color:#9aa0a6; border:none; padding:2px 6px; cursor:pointer; font-size:13px;">✕</button>
+    `;
+    banner.style.cssText = `
+      position: fixed;
+      top: 14px;
+      right: 20px;
+      z-index: 2147483647;
+      background: #202124;
+      color: #fff;
+      padding: 8px 14px;
+      border-radius: 8px;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 12.5px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    `;
+    document.body.appendChild(banner);
+    const reloadBtn = document.getElementById("idlc-btn-reload-page");
+    if (reloadBtn) reloadBtn.addEventListener("click", () => window.location.reload());
+    const dismissBtn = document.getElementById("idlc-btn-dismiss-reload");
+    if (dismissBtn) dismissBtn.addEventListener("click", () => banner.remove());
+  }
+
+  function safeSendMessage(message, callback) {
+    if (!isExtensionValid()) {
+      handleContextInvalidated();
+      if (callback) callback({ success: false, error: "EXTENSION_CONTEXT_INVALIDATED" });
+      return;
+    }
+
+    try {
+      const p = chrome.runtime.sendMessage(message, (res) => {
+        if (chrome.runtime.lastError) {
+          const err = chrome.runtime.lastError.message || "";
+          if (err.toLowerCase().includes("context invalidated") || err.toLowerCase().includes("receiving end does not exist")) {
+            handleContextInvalidated();
+          }
+          if (callback) callback({ success: false, error: err });
+        } else {
+          if (callback) callback(res || { success: true });
+        }
+      });
+      if (p && typeof p.catch === "function") {
+        p.catch((err) => {
+          if (String(err).toLowerCase().includes("context invalidated")) {
+            handleContextInvalidated();
+          }
+          if (callback) callback({ success: false, error: String(err) });
+        });
+      }
+    } catch (err) {
+      if (String(err).toLowerCase().includes("context invalidated")) {
+        handleContextInvalidated();
+      }
+      if (callback) callback({ success: false, error: String(err) });
+    }
+  }
+
+  // Load saved settings & history
+  if (isExtensionValid() && chrome.storage && chrome.storage.local) {
+    try {
+      chrome.storage.local.get(
+        [
+          "filterQuery", "subfolder", "staggerDelayMs", "jitterMs",
+          "batchPauseEvery", "safeMode", "skipDuplicates", "requireConfirmation",
+          "downloadAsZip", "autoAdvancePages", "maxPagesToCrawl",
+          "playAudioChime", "desktopNotification",
+          "startDate", "endDate", "downloadHistory"
+        ],
+        (data) => {
+          if (chrome.runtime.lastError) {
+            handleContextInvalidated();
+            return;
+          }
+          if (data.filterQuery !== undefined) CONFIG.filterQuery = data.filterQuery;
+          if (data.subfolder) CONFIG.subfolder = cleanSubfolderName(data.subfolder);
+          if (data.staggerDelayMs) CONFIG.staggerDelayMs = Number(data.staggerDelayMs);
+          if (data.jitterMs !== undefined) CONFIG.jitterMs = Number(data.jitterMs);
+          if (typeof data.safeMode === "boolean") CONFIG.safeMode = data.safeMode;
+          if (typeof data.skipDuplicates === "boolean") CONFIG.skipDuplicates = data.skipDuplicates;
+          if (typeof data.requireConfirmation === "boolean") CONFIG.requireConfirmation = data.requireConfirmation;
+          if (typeof data.downloadAsZip === "boolean") CONFIG.downloadAsZip = data.downloadAsZip;
+          if (typeof data.autoAdvancePages === "boolean") CONFIG.autoAdvancePages = data.autoAdvancePages;
+          if (data.maxPagesToCrawl) CONFIG.maxPagesToCrawl = Number(data.maxPagesToCrawl);
+          if (typeof data.playAudioChime === "boolean") CONFIG.playAudioChime = data.playAudioChime;
+          if (typeof data.desktopNotification === "boolean") CONFIG.desktopNotification = data.desktopNotification;
+          if (data.startDate) CONFIG.startDate = data.startDate;
+          if (data.endDate) CONFIG.endDate = data.endDate;
+          if (data.downloadHistory) downloadHistoryCache = data.downloadHistory;
+          updateUI();
+        }
+      );
+    } catch (e) {
+      handleContextInvalidated();
+    }
   }
 
   /* ==========================================================================
@@ -476,6 +583,10 @@
 
   function isDuplicateFile(targetPath, downloadUrl) {
     if (!CONFIG.skipDuplicates) return Promise.resolve(false);
+    if (!isExtensionValid()) {
+      handleContextInvalidated();
+      return Promise.resolve(false);
+    }
 
     if (downloadHistoryCache[targetPath]) return Promise.resolve(true);
     if (downloadUrl && downloadHistoryCache[downloadUrl]) return Promise.resolve(true);
@@ -483,14 +594,10 @@
     if (basename && downloadHistoryCache[basename]) return Promise.resolve(true);
 
     return new Promise((resolve) => {
-      chrome.runtime.sendMessage(
+      safeSendMessage(
         { action: "checkDuplicate", filename: targetPath, url: downloadUrl },
         (res) => {
-          if (chrome.runtime.lastError) {
-            resolve(false);
-          } else {
-            resolve(Boolean(res && res.isDuplicate));
-          }
+          resolve(Boolean(res && res.isDuplicate));
         }
       );
     });
@@ -527,8 +634,8 @@
   }
 
   function triggerDesktopNotification(title, message) {
-    if (!CONFIG.desktopNotification) return;
-    chrome.runtime.sendMessage({
+    if (!CONFIG.desktopNotification || !isExtensionValid()) return;
+    safeSendMessage({
       action: "showNotification",
       title: title,
       message: message
@@ -570,8 +677,12 @@
     if (fullUrl && !isSafeGmailUrl(fullUrl)) {
       return Promise.resolve({ success: false, error: "SECURITY: Blocked unsafe download URL." });
     }
+    if (!isExtensionValid()) {
+      handleContextInvalidated();
+      return Promise.resolve({ success: false, error: "Extension was reloaded. Please refresh this tab." });
+    }
     return new Promise((resolve) => {
-      chrome.runtime.sendMessage(
+      safeSendMessage(
         {
           action: "downloadFile",
           url: fullUrl,
@@ -579,12 +690,12 @@
           conflictAction: "uniquify"
         },
         (response) => {
-          if (chrome.runtime.lastError) {
-            resolve({ success: false, error: chrome.runtime.lastError.message });
+          if (!response || !response.success) {
+            resolve({ success: false, error: (response && response.error) || "Download failed." });
           } else {
             downloadHistoryCache[filename] = { timestamp: Date.now() };
             if (fullUrl) downloadHistoryCache[fullUrl] = { timestamp: Date.now() };
-            resolve(response || { success: true });
+            resolve(response);
           }
         }
       );
@@ -680,7 +791,7 @@
     const cleanSub = cleanSubfolderName(CONFIG.subfolder);
     const csvFilename = `${cleanSub}/download_manifest_${dateStr}.csv`;
 
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       action: "downloadFile",
       url: url,
       filename: csvFilename,
@@ -694,9 +805,18 @@
   async function promptAndStartBulkDownload() {
     if (isDownloading) return;
 
+    if (!isExtensionValid()) {
+      handleContextInvalidated();
+      return;
+    }
+
     if (chrome.storage && chrome.storage.local) {
-      const data = await chrome.storage.local.get(["downloadHistory"]);
-      if (data.downloadHistory) downloadHistoryCache = data.downloadHistory;
+      try {
+        const data = await chrome.storage.local.get(["downloadHistory"]);
+        if (data && data.downloadHistory) downloadHistoryCache = data.downloadHistory;
+      } catch (e) {
+        handleContextInvalidated();
+      }
     }
 
     const items = getFilteredAttachments();
@@ -1259,7 +1379,7 @@
         const cleanSub = cleanSubfolderName(CONFIG.subfolder);
         const zipFilename = `${cleanSub}/${cleanSub}_${dateStr}.zip`;
 
-        chrome.runtime.sendMessage({
+        safeSendMessage({
           action: "downloadFile",
           url: zipUrl,
           filename: zipFilename,
@@ -1549,7 +1669,7 @@
     clearHistoryBtn.addEventListener("click", () => {
       if (confirm("Clear local download history cache? Previously downloaded files can then be downloaded again.")) {
         downloadHistoryCache = {};
-        chrome.runtime.sendMessage({ action: "clearDownloadHistory" }, () => {
+        safeSendMessage({ action: "clearDownloadHistory" }, () => {
           showToast("History Cleared", "Download history reset. Duplicate check refreshed.", { duration: 2500 });
         });
       }
@@ -1585,20 +1705,24 @@
       CONFIG.startDate = startDate;
       CONFIG.endDate = endDate;
 
-      if (chrome.storage && chrome.storage.local) {
-        chrome.storage.local.set({
-          filterQuery: q,
-          subfolder: sf,
-          prefixDate: pd,
-          skipDuplicates: sd,
-          safeMode: sm,
-          requireConfirmation: rc,
-          downloadAsZip: dz,
-          autoAdvancePages: ap,
-          maxPagesToCrawl: mp,
-          startDate: startDate,
-          endDate: endDate
-        });
+      if (isExtensionValid() && chrome.storage && chrome.storage.local) {
+        try {
+          chrome.storage.local.set({
+            filterQuery: q,
+            subfolder: sf,
+            prefixDate: pd,
+            skipDuplicates: sd,
+            safeMode: sm,
+            requireConfirmation: rc,
+            downloadAsZip: dz,
+            autoAdvancePages: ap,
+            maxPagesToCrawl: mp,
+            startDate: startDate,
+            endDate: endDate
+          });
+        } catch (e) {
+          handleContextInvalidated();
+        }
       }
 
       popover.classList.remove("idlc-open");
@@ -1741,7 +1865,7 @@
       const folderBtn = document.getElementById("idlc-btn-open-folder");
       if (folderBtn) {
         folderBtn.addEventListener("click", () => {
-          chrome.runtime.sendMessage({ action: "openDownloadsFolder" });
+          safeSendMessage({ action: "openDownloadsFolder" });
         });
       }
     }
@@ -1768,13 +1892,21 @@
   }
 
   /* ==========================================================================
-     SPA Resilience & Lifecycle
+     SPA Resilience & Lifecycle (Context Invalidation Safe)
      ========================================================================== */
 
   let debounceTimer = null;
   const observer = new MutationObserver(() => {
+    if (!isExtensionValid()) {
+      handleContextInvalidated();
+      return;
+    }
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
+      if (!isExtensionValid()) {
+        handleContextInvalidated();
+        return;
+      }
       if (!document.getElementById("idlc-fab-container")) {
         injectUI();
       }
@@ -1782,20 +1914,38 @@
     }, 350);
   });
 
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true
+  try {
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  } catch (e) {}
+
+  window.addEventListener("popstate", () => {
+    if (isExtensionValid()) setTimeout(updateUI, 500);
+    else handleContextInvalidated();
+  });
+  window.addEventListener("hashchange", () => {
+    if (isExtensionValid()) setTimeout(updateUI, 500);
+    else handleContextInvalidated();
   });
 
-  window.addEventListener("popstate", () => setTimeout(updateUI, 500));
-  window.addEventListener("hashchange", () => setTimeout(updateUI, 500));
-
-  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.action === "triggerBulkDownload") {
-      promptAndStartBulkDownload();
-      sendResponse({ status: "modal_opened" });
+  if (isExtensionValid()) {
+    try {
+      chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        if (!isExtensionValid()) {
+          handleContextInvalidated();
+          return;
+        }
+        if (request.action === "triggerBulkDownload") {
+          promptAndStartBulkDownload();
+          sendResponse({ status: "modal_opened" });
+        }
+      });
+    } catch (e) {
+      handleContextInvalidated();
     }
-  });
+  }
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", injectUI);

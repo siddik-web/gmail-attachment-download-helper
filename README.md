@@ -65,7 +65,7 @@ To guarantee **100% account safety and zero risk of rate-limiting, temporary blo
 ### Option 1: Install from GitHub Release (Recommended)
 
 1. Go to the [**Latest Release**](https://github.com/siddik-web/gmail-attachment-download-helper/releases/latest) page.
-2. Download the `gmail-bulk-attachment-downloader-v1.2.1.zip` file under **Assets**.
+2. Download the `gmail-bulk-attachment-downloader-v1.2.2.zip` file under **Assets**.
 3. Unzip the file into a folder of your choice on your computer.
 4. Open Google Chrome and navigate to:
    ```text
