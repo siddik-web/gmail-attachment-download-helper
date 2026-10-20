@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "Gmail Bulk Attachment Downloader",
+  "version": "1.2.0",
+  "description": "Bulk downloads attachments from Gmail search results with ZIP bundling, multi-page crawling, CSV audit manifests, date filters, and duplicate prevention.",
+  "permissions": [
+    "downloads",
+    "activeTab",
+    "storage",
+    "notifications"
+  ],
+  "host_permissions": [
+    "https://mail.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://mail.google.com/*"
+      ],
+      "js": [
+        "lib/jszip.min.js",
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Gmail Bulk Attachment Downloader",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
