@@ -105,6 +105,38 @@ async function checkDuplicate(request, sendResponse) {
 }
 
 /**
+ * Validates that download URLs are restricted to Gmail/Google CDN or safe data/blob schemes
+ */
+function isSafeDownloadUrl(url) {
+  if (!url || typeof url !== "string") return false;
+  if (url.startsWith("blob:") || url.startsWith("data:")) return true;
+  try {
+    const parsed = new URL(url, "https://mail.google.com");
+    if (parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.toLowerCase();
+    return host === "mail.google.com" || host.endsWith(".google.com") || host.endsWith(".googleusercontent.com");
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Sanitizes target filenames to eliminate path traversal and illegal characters
+ */
+function sanitizeDownloadFilename(filename) {
+  if (!filename || typeof filename !== "string") return "attachment.bin";
+  let clean = filename.replace(/\\/g, "/");
+  clean = clean.replace(/^[a-zA-Z]:/, "").replace(/^\/+/, "");
+  const segments = clean.split("/").map((seg) => {
+    return seg
+      .replace(/\.\.+/g, "")
+      .replace(/[\\/:*?"<>|]+/g, "_")
+      .trim();
+  }).filter(Boolean);
+  return segments.join("/") || "attachment.bin";
+}
+
+/**
  * Executes file download using chrome.downloads API and records into history
  */
 async function handleDownload(request, sendResponse) {
@@ -115,16 +147,24 @@ async function handleDownload(request, sendResponse) {
     return;
   }
 
-  try {
-    let downloadUrl = url;
-    if (downloadUrl.startsWith("/")) {
-      downloadUrl = "https://mail.google.com" + downloadUrl;
-    }
+  let downloadUrl = url;
+  if (downloadUrl.startsWith("/")) {
+    downloadUrl = "https://mail.google.com" + downloadUrl;
+  }
 
+  if (!isSafeDownloadUrl(downloadUrl)) {
+    console.warn("[Gmail Downloader] Blocked unsafe download URL:", downloadUrl);
+    sendResponse({ success: false, error: "SECURITY: Rejected unsafe or untrusted download URL." });
+    return;
+  }
+
+  const safeFilename = sanitizeDownloadFilename(filename);
+
+  try {
     chrome.downloads.download(
       {
         url: downloadUrl,
-        filename: filename,
+        filename: safeFilename,
         conflictAction: conflictAction,
         saveAs: false
       },
@@ -138,9 +178,9 @@ async function handleDownload(request, sendResponse) {
             return;
           }
 
-          attemptFetchFallback(downloadUrl, filename, conflictAction, sendResponse);
+          attemptFetchFallback(downloadUrl, safeFilename, conflictAction, sendResponse);
         } else {
-          recordDownloadSuccess(filename, downloadUrl);
+          recordDownloadSuccess(safeFilename, downloadUrl);
           sendResponse({ success: true, downloadId });
         }
       }
@@ -155,6 +195,10 @@ async function handleDownload(request, sendResponse) {
  * Fallback: fetch blob with cookies and convert to data URI
  */
 async function attemptFetchFallback(url, filename, conflictAction, sendResponse) {
+  if (!isSafeDownloadUrl(url)) {
+    sendResponse({ success: false, error: "SECURITY: Rejected unsafe URL for fallback fetch." });
+    return;
+  }
   try {
     const response = await fetch(url, { credentials: "include" });
 

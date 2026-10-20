@@ -46,6 +46,55 @@
   let currentRunAuditLog = [];
   let currentCrawledPage = 1;
 
+  /* ==========================================================================
+     Security Sanitization Helpers (XSS, CSV Formula Injection, Path & URL)
+     ========================================================================== */
+
+  function escapeHtml(str) {
+    if (str === null || str === undefined) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
+  function sanitizeCsvCell(val) {
+    let s = val === null || val === undefined ? "" : String(val);
+    // Neutralize spreadsheet formula injection (=, +, -, @, tab, CR)
+    if (/^[=+\-@\t\r]/.test(s)) {
+      s = "'" + s;
+    }
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+
+  function cleanSubfolderName(folder) {
+    if (!folder || typeof folder !== "string") return "Gmail_Attachments";
+    let clean = folder.replace(/\\/g, "/");
+    clean = clean.replace(/^[a-zA-Z]:/, "").replace(/^\/+/, "");
+    const parts = clean.split("/").map((seg) => {
+      return seg
+        .replace(/\.\.+/g, "")
+        .replace(/[\\/:*?"<>|]+/g, "_")
+        .trim();
+    }).filter(Boolean);
+    return parts.join("/") || "Gmail_Attachments";
+  }
+
+  function isSafeGmailUrl(url) {
+    if (!url || typeof url !== "string") return false;
+    if (url.startsWith("blob:") || url.startsWith("data:")) return true;
+    try {
+      const parsed = new URL(url, "https://mail.google.com");
+      if (parsed.protocol !== "https:") return false;
+      const host = parsed.hostname.toLowerCase();
+      return host === "mail.google.com" || host.endsWith(".google.com") || host.endsWith(".googleusercontent.com");
+    } catch (e) {
+      return false;
+    }
+  }
+
   // Load saved settings & history
   if (chrome.storage && chrome.storage.local) {
     chrome.storage.local.get(
@@ -58,7 +107,7 @@
       ],
       (data) => {
         if (data.filterQuery !== undefined) CONFIG.filterQuery = data.filterQuery;
-        if (data.subfolder) CONFIG.subfolder = data.subfolder;
+        if (data.subfolder) CONFIG.subfolder = cleanSubfolderName(data.subfolder);
         if (data.staggerDelayMs) CONFIG.staggerDelayMs = Number(data.staggerDelayMs);
         if (data.jitterMs !== undefined) CONFIG.jitterMs = Number(data.jitterMs);
         if (typeof data.safeMode === "boolean") CONFIG.safeMode = data.safeMode;
@@ -217,6 +266,7 @@
     if (!str) return "attachment.bin";
     let name = str.replace(/^(Download attachment|Download|Preview|View|Loading)\s+/i, "");
     name = name.replace(/[\r\n\t]+/g, " ").trim();
+    name = name.replace(/\.\.+/g, "");
     name = name.replace(/[\\/:*?"<>|]/g, "_");
     return name || "attachment.bin";
   }
@@ -490,7 +540,13 @@
      ========================================================================== */
 
   async function fetchFileBlob(url) {
-    const fullUrl = url.startsWith("/") ? "https://mail.google.com" + url : url;
+    let fullUrl = url;
+    if (fullUrl.startsWith("/")) {
+      fullUrl = "https://mail.google.com" + fullUrl;
+    }
+    if (!isSafeGmailUrl(fullUrl)) {
+      throw new Error("SECURITY: Blocked unsafe or untrusted URL for blob fetch.");
+    }
     const response = await fetch(fullUrl, { credentials: "include" });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} ${response.statusText}`);
@@ -507,11 +563,18 @@
   }
 
   function executeDownloadViaBackground(url, filename) {
+    let fullUrl = url;
+    if (fullUrl && fullUrl.startsWith("/")) {
+      fullUrl = "https://mail.google.com" + fullUrl;
+    }
+    if (fullUrl && !isSafeGmailUrl(fullUrl)) {
+      return Promise.resolve({ success: false, error: "SECURITY: Blocked unsafe download URL." });
+    }
     return new Promise((resolve) => {
       chrome.runtime.sendMessage(
         {
           action: "downloadFile",
-          url: url,
+          url: fullUrl,
           filename: filename,
           conflictAction: "uniquify"
         },
@@ -520,7 +583,7 @@
             resolve({ success: false, error: chrome.runtime.lastError.message });
           } else {
             downloadHistoryCache[filename] = { timestamp: Date.now() };
-            if (url) downloadHistoryCache[url] = { timestamp: Date.now() };
+            if (fullUrl) downloadHistoryCache[fullUrl] = { timestamp: Date.now() };
             resolve(response || { success: true });
           }
         }
@@ -601,20 +664,21 @@
 
     const headers = ["Email Date", "Sender", "Subject", "Saved Filename", "Original Filename", "Status", "Timestamp"];
     const rows = currentRunAuditLog.map((r) => [
-      `"${(r.date || "").replace(/"/g, '""')}"`,
-      `"${(r.sender || "").replace(/"/g, '""')}"`,
-      `"${(r.subject || "").replace(/"/g, '""')}"`,
-      `"${(r.filename || "").replace(/"/g, '""')}"`,
-      `"${(r.originalFilename || "").replace(/"/g, '""')}"`,
-      `"${(r.status || "").replace(/"/g, '""')}"`,
-      `"${(r.timestamp || "").replace(/"/g, '""')}"`
+      sanitizeCsvCell(r.date),
+      sanitizeCsvCell(r.sender),
+      sanitizeCsvCell(r.subject),
+      sanitizeCsvCell(r.filename),
+      sanitizeCsvCell(r.originalFilename),
+      sanitizeCsvCell(r.status),
+      sanitizeCsvCell(r.timestamp)
     ]);
 
     const csvContent = [headers.join(","), ...rows.map((row) => row.join(","))].join("\r\n");
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const dateStr = getTodayFormatted();
-    const csvFilename = `${CONFIG.subfolder}/download_manifest_${dateStr}.csv`;
+    const cleanSub = cleanSubfolderName(CONFIG.subfolder);
+    const csvFilename = `${cleanSub}/download_manifest_${dateStr}.csv`;
 
     chrome.runtime.sendMessage({
       action: "downloadFile",
@@ -639,11 +703,11 @@
 
     if (items.length === 0) {
       const dateInfo = CONFIG.startDate || CONFIG.endDate
-        ? ` between <b>${CONFIG.startDate || "earliest"}</b> and <b>${CONFIG.endDate || "today"}</b>`
+        ? ` between <b>${escapeHtml(CONFIG.startDate || "earliest")}</b> and <b>${escapeHtml(CONFIG.endDate || "today")}</b>`
         : "";
       showToast(
         "No matching attachments found",
-        `No visible attachments matching filter "<b>${CONFIG.filterQuery}</b>"${dateInfo} were found.<br><br>` +
+        `No visible attachments matching filter "<b>${escapeHtml(CONFIG.filterQuery)}</b>"${dateInfo} were found.<br><br>` +
         `<i>Tip: In Gmail search bar, try:</i><br><code>has:attachment</code> or adjust your date range.`,
         { isError: true, duration: 6000 }
       );
@@ -679,8 +743,9 @@
         ? `${datePrefix}_${item.originalFilename}`
         : item.originalFilename;
 
-      const subpath = CONFIG.subfolder
-        ? `${CONFIG.subfolder.replace(/[\\/]+$/, "")}/${finalName}`
+      const cleanSub = cleanSubfolderName(CONFIG.subfolder);
+      const subpath = cleanSub
+        ? `${cleanSub}/${finalName}`
         : finalName;
 
       const isDupe = CONFIG.skipDuplicates ? await isDuplicateFile(subpath, item.downloadUrl) : false;
@@ -735,6 +800,7 @@
       const dateRangeLabel = CONFIG.startDate || CONFIG.endDate
         ? `${CONFIG.startDate || "Earliest"} → ${CONFIG.endDate || "Today"}`
         : "All Visible Dates";
+      const cleanSub = cleanSubfolderName(CONFIG.subfolder);
 
       overlay.innerHTML = `
         <div class="idlc-modal-card">
@@ -750,7 +816,7 @@
             <!-- Format Choice: ZIP Archive vs Individual Files -->
             <div class="idlc-format-choice">
               <div class="idlc-format-opt ${!chosenFormatIsZip ? "idlc-format-active" : ""}" data-format="individual">
-                📁 Individual Files (to ${CONFIG.subfolder}/)
+                📁 Individual Files (to ${escapeHtml(cleanSub)}/)
               </div>
               <div class="idlc-format-opt ${chosenFormatIsZip ? "idlc-format-active" : ""}" data-format="zip">
                 📦 Single .ZIP Archive (Bundles all into 1 file)
@@ -771,7 +837,7 @@
               </div>
               <div class="idlc-summary-item">
                 <span class="idlc-summary-label">Date Filter</span>
-                <span class="idlc-summary-val">${dateRangeLabel}</span>
+                <span class="idlc-summary-val">${escapeHtml(dateRangeLabel)}</span>
               </div>
               <div class="idlc-summary-item">
                 <span class="idlc-summary-label">Account Protection</span>
@@ -784,11 +850,11 @@
               <div class="idlc-modal-search-row">
                 <div class="idlc-modal-search-box">
                   <svg class="idlc-modal-search-icon" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-                  <input id="idlc-modal-search-input" type="text" placeholder="Search filename, date, or subject..." value="${modalSearchQuery}">
+                  <input id="idlc-modal-search-input" type="text" placeholder="Search filename, date, or subject..." value="${escapeHtml(modalSearchQuery)}">
                 </div>
                 <div class="idlc-modal-search-box">
                   <svg class="idlc-modal-search-icon" viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>
-                  <input id="idlc-modal-sender-input" type="text" placeholder="Filter by sender (e.g. idlc)..." value="${modalSenderQuery}">
+                  <input id="idlc-modal-sender-input" type="text" placeholder="Filter by sender (e.g. idlc)..." value="${escapeHtml(modalSenderQuery)}">
                 </div>
               </div>
 
@@ -825,14 +891,14 @@
                       <div class="idlc-preview-left">
                         <input type="checkbox" class="idlc-item-checkbox" data-id="${item.id}" ${item.selected ? "checked" : ""}>
                         <div class="idlc-preview-col">
-                          <span class="idlc-preview-file" title="${item.subpath}">${item.originalFilename}</span>
-                          <span class="idlc-preview-subline" title="${item.sender} - ${item.subject}">
-                            ✉️ ${item.sender} • ${item.subject}
+                          <span class="idlc-preview-file" title="${escapeHtml(item.subpath)}">${escapeHtml(item.originalFilename)}</span>
+                          <span class="idlc-preview-subline" title="${escapeHtml(item.sender)} - ${escapeHtml(item.subject)}">
+                            ✉️ ${escapeHtml(item.sender)} • ${escapeHtml(item.subject)}
                           </span>
                         </div>
                       </div>
                       <div class="idlc-preview-right">
-                        <span class="idlc-preview-date">${item.date}</span>
+                        <span class="idlc-preview-date">${escapeHtml(item.date)}</span>
                         <span class="idlc-badge-tag ${item.isDupe ? "idlc-badge-dupe" : "idlc-badge-new"}">
                           ${item.isDupe ? "Saved" : "New"}
                         </span>
@@ -1069,7 +1135,7 @@
         const progressPercent = Math.round(((i + 1) / items.length) * 100);
         updateToastProgress(
           `Skipping Duplicate <b>${i + 1} of ${items.length}</b>`,
-          `File: <code>${item.originalFilename}</code><br><span style="color:#e37400;">⚠️ Already in downloads. Skipped.</span>`,
+          `File: <code>${escapeHtml(item.originalFilename)}</code><br><span style="color:#e37400;">⚠️ Already in downloads. Skipped.</span>`,
           progressPercent,
           i + 1,
           items.length
@@ -1096,7 +1162,7 @@
 
       updateToastProgress(
         asZip ? `Fetching for ZIP <b>${i + 1} of ${items.length}</b>` : `Downloading <b>${i + 1} of ${items.length}</b>`,
-        `File: <b>${item.originalFilename}</b><br>Path: <code>${subpath}</code>`,
+        `File: <b>${escapeHtml(item.originalFilename)}</b><br>Path: <code>${escapeHtml(subpath)}</code>`,
         progressPercent,
         i + 1,
         items.length
@@ -1175,16 +1241,23 @@
 
       // Add audit manifest inside the zip
       const manifestHeaders = "Email Date,Sender,Subject,Saved Filename,Original Filename,Status,Timestamp\r\n";
-      const manifestRows = currentRunAuditLog.map((r) =>
-        `"${r.date}","${(r.sender||"").replace(/"/g,'""')}","${(r.subject||"").replace(/"/g,'""')}","${r.filename}","${r.originalFilename}","${r.status}","${r.timestamp}"`
-      ).join("\r\n");
+      const manifestRows = currentRunAuditLog.map((r) => [
+        sanitizeCsvCell(r.date),
+        sanitizeCsvCell(r.sender),
+        sanitizeCsvCell(r.subject),
+        sanitizeCsvCell(r.filename),
+        sanitizeCsvCell(r.originalFilename),
+        sanitizeCsvCell(r.status),
+        sanitizeCsvCell(r.timestamp)
+      ].join(",")).join("\r\n");
       zipInstance.file("manifest.csv", manifestHeaders + manifestRows);
 
       try {
         const zipBlob = await zipInstance.generateAsync({ type: "blob" });
         const zipUrl = URL.createObjectURL(zipBlob);
         const dateStr = getTodayFormatted();
-        const zipFilename = `${CONFIG.subfolder}/${CONFIG.subfolder}_${dateStr}.zip`;
+        const cleanSub = cleanSubfolderName(CONFIG.subfolder);
+        const zipFilename = `${cleanSub}/${cleanSub}_${dateStr}.zip`;
 
         chrome.runtime.sendMessage({
           action: "downloadFile",
@@ -1208,14 +1281,15 @@
         : `Successfully downloaded ${completedCount} attachment(s) to ${CONFIG.subfolder}/`;
       triggerDesktopNotification("Bulk Download Complete! 🎉", notifMsg);
 
-      const folderMsg = asZip ? `Downloads/${CONFIG.subfolder}/ (Single .ZIP file)` : `Downloads/${CONFIG.subfolder}/`;
+      const cleanSub = cleanSubfolderName(CONFIG.subfolder);
+      const folderMsg = asZip ? `Downloads/${cleanSub}/ (Single .ZIP file)` : `Downloads/${cleanSub}/`;
       const skippedMsg = skippedCount > 0 ? ` (<b>${skippedCount}</b> duplicates skipped)` : "";
 
       showToast(
         "Bulk Download Completed! 🎉",
         `Processed <b>${completedCount}</b> file(s)${skippedMsg}` +
         (failedCount > 0 ? ` (<b>${failedCount}</b> failed)` : "") +
-        `.<br>Saved to: <code>${folderMsg}</code>`,
+        `.<br>Saved to: <code>${escapeHtml(folderMsg)}</code>`,
         { showOpenFolder: true, showExportCsv: true, duration: 9000 }
       );
 
@@ -1309,7 +1383,7 @@
 
         <div class="idlc-form-group">
           <label class="idlc-form-label" for="idlc-cfg-filter">Filename / Extension Filter</label>
-          <input id="idlc-cfg-filter" class="idlc-input" type="text" placeholder="* (All files), .pdf, .xlsx, or Portfolio_U533.pdf" value="${CONFIG.filterQuery}">
+          <input id="idlc-cfg-filter" class="idlc-input" type="text" placeholder="* (All files), .pdf, .xlsx, or Portfolio_U533.pdf" value="${escapeHtml(CONFIG.filterQuery)}">
         </div>
 
         <!-- Date Range Filter -->
@@ -1384,7 +1458,7 @@
         <div class="idlc-section-header">💾 Save Destination</div>
         <div class="idlc-form-group">
           <label class="idlc-form-label" for="idlc-cfg-subfolder">Subfolder (in Downloads/)</label>
-          <input id="idlc-cfg-subfolder" class="idlc-input" type="text" value="${CONFIG.subfolder}">
+          <input id="idlc-cfg-subfolder" class="idlc-input" type="text" value="${escapeHtml(CONFIG.subfolder)}">
         </div>
 
         <div style="display:flex; align-items:center; gap:8px;">
@@ -1488,7 +1562,7 @@
     // Save Configuration
     saveCfgBtn.addEventListener("click", () => {
       const q = document.getElementById("idlc-cfg-filter").value.trim() || "*";
-      const sf = document.getElementById("idlc-cfg-subfolder").value.trim() || "Gmail_Attachments";
+      const sf = cleanSubfolderName(document.getElementById("idlc-cfg-subfolder").value.trim() || "Gmail_Attachments");
       const pd = document.getElementById("idlc-cfg-prefix-date").checked;
       const sd = document.getElementById("idlc-cfg-skip-dupes").checked;
       const sm = document.getElementById("idlc-cfg-safe-mode").checked;
@@ -1531,7 +1605,7 @@
       updateUI();
 
       const zipMsg = dz ? " | Output: <b>ZIP</b>" : " | Output: <b>Individual</b>";
-      showToast("Settings Saved", `Filter: <b>${q}</b>${zipMsg}<br>Safe Mode: <b>${sm ? "ON 🛡️" : "OFF"}</b>`, { duration: 3500 });
+      showToast("Settings Saved", `Filter: <b>${escapeHtml(q)}</b>${zipMsg}<br>Safe Mode: <b>${sm ? "ON 🛡️" : "OFF"}</b>`, { duration: 3500 });
     });
 
     document.addEventListener("click", (e) => {
@@ -1555,7 +1629,7 @@
       `;
     } else {
       btn.disabled = false;
-      const label = CONFIG.filterQuery === "*" ? "Download Attachments" : `Download (${CONFIG.filterQuery})`;
+      const label = CONFIG.filterQuery === "*" ? "Download Attachments" : `Download (${escapeHtml(CONFIG.filterQuery)})`;
       btn.innerHTML = `
         <span class="idlc-icon">
           <svg viewBox="0 0 24 24">
@@ -1632,7 +1706,7 @@
           <svg style="width:16px; height:16px; fill:var(--idlc-primary);" viewBox="0 0 24 24">
             <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
           </svg>
-          ${title}
+          ${escapeHtml(title)}
         </span>
         <button id="idlc-toast-dismiss" class="idlc-toast-close">✕</button>
       </div>
