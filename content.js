@@ -237,7 +237,14 @@
      Attachment Discovery & Meta Extraction (Date, Sender, Subject)
      ========================================================================== */
 
-  function scanAllAttachments() {
+  let lastScanTimestamp = 0;
+
+  function scanAllAttachments(forceScan = false) {
+    const now = Date.now();
+    if (!forceScan && detectedAttachments.length > 0 && (now - lastScanTimestamp < 600)) {
+      return detectedAttachments;
+    }
+
     const rawItems = [];
     const seenElements = new Set();
     const seenUrls = new Set();
@@ -342,6 +349,7 @@
     }
 
     detectedAttachments = rawItems;
+    lastScanTimestamp = Date.now();
     return rawItems;
   }
 
@@ -460,8 +468,8 @@
     return map[ext] || "application/octet-stream";
   }
 
-  function getFilteredAttachments() {
-    const all = scanAllAttachments();
+  function getFilteredAttachments(forceScan = false) {
+    const all = scanAllAttachments(forceScan);
     const query = (CONFIG.filterQuery || "*").trim();
     const startDate = (CONFIG.startDate || "").trim();
     const endDate = (CONFIG.endDate || "").trim();
@@ -819,7 +827,7 @@
       }
     }
 
-    const items = getFilteredAttachments();
+    const items = getFilteredAttachments(true);
 
     if (items.length === 0) {
       const dateInfo = CONFIG.startDate || CONFIG.endDate
@@ -842,86 +850,49 @@
   }
 
   /**
-   * Confirmation & Selection Modal with Multi-Search & ZIP choice
+   * Confirmation & Selection Modal with Debounced Multi-Search, Placeholder Skeleton, & Zero Layout Shift
    */
   async function showConfirmationModal(rawItems) {
     const overlay = document.getElementById("idlc-modal-overlay");
     if (!overlay) return;
 
-    const dateCounts = {};
-    const modalItems = [];
-    let initialDupeCount = 0;
-
-    for (let i = 0; i < rawItems.length; i++) {
-      const item = rawItems[i];
-      const baseDate = item.date;
-      dateCounts[baseDate] = (dateCounts[baseDate] || 0) + 1;
-      const countForDate = dateCounts[baseDate];
-      const datePrefix = countForDate > 1 ? `${baseDate}_(${countForDate})` : baseDate;
-
-      const finalName = CONFIG.prefixDate
-        ? `${datePrefix}_${item.originalFilename}`
-        : item.originalFilename;
-
-      const cleanSub = cleanSubfolderName(CONFIG.subfolder);
-      const subpath = cleanSub
-        ? `${cleanSub}/${finalName}`
-        : finalName;
-
-      const isDupe = CONFIG.skipDuplicates ? await isDuplicateFile(subpath, item.downloadUrl) : false;
-      if (isDupe) initialDupeCount++;
-
-      modalItems.push({
-        id: i,
-        ...item,
-        subpath,
-        isDupe,
-        selected: !isDupe || !CONFIG.skipDuplicates
-      });
-    }
-
     let activeFilterCategory = "all";
     let modalSearchQuery = "";
     let modalSenderQuery = "";
     let chosenFormatIsZip = CONFIG.downloadAsZip;
+    let searchDebounceTimer = null;
+    let modalItems = [];
+    let initialDupeCount = 0;
 
-    function renderModalContent() {
-      const filteredList = modalItems.filter((item) => {
-        const fname = item.originalFilename.toLowerCase();
-        const ext = (fname.split(".").pop() || "").toLowerCase();
-        const sender = (item.sender || "").toLowerCase();
-        const subject = (item.subject || "").toLowerCase();
+    const totalCount = rawItems.length;
+    const dateRangeLabel = CONFIG.startDate || CONFIG.endDate
+      ? `${CONFIG.startDate || "Earliest"} → ${CONFIG.endDate || "Today"}`
+      : "All Visible Dates";
+    const cleanSub = cleanSubfolderName(CONFIG.subfolder);
 
-        if (activeFilterCategory === "new" && item.isDupe) return false;
-        if (activeFilterCategory === "dupe" && !item.isDupe) return false;
-        if (activeFilterCategory === "pdf" && ext !== "pdf") return false;
-        if (activeFilterCategory === "excel" && !["xlsx", "xls", "csv"].includes(ext)) return false;
+    function getSkeletonRowsHtml(count = 4) {
+      let rows = "";
+      for (let i = 0; i < count; i++) {
+        rows += `
+          <div class="idlc-skeleton-row">
+            <div class="idlc-skeleton-left">
+              <div class="idlc-skeleton-checkbox"></div>
+              <div class="idlc-skeleton-col">
+                <div class="idlc-skeleton-line idlc-skeleton-line-title" style="width: ${50 + (i % 3) * 15}%;"></div>
+                <div class="idlc-skeleton-line idlc-skeleton-line-sub" style="width: ${70 + (i % 2) * 15}%;"></div>
+              </div>
+            </div>
+            <div class="idlc-skeleton-right">
+              <div class="idlc-skeleton-line" style="width: 55px;"></div>
+              <div class="idlc-skeleton-badge"></div>
+            </div>
+          </div>
+        `;
+      }
+      return rows;
+    }
 
-        if (modalSearchQuery) {
-          const matchName = fname.includes(modalSearchQuery);
-          const matchDate = (item.date || "").includes(modalSearchQuery);
-          const matchSubj = subject.includes(modalSearchQuery);
-          if (!matchName && !matchDate && !matchSubj) return false;
-        }
-
-        if (modalSenderQuery) {
-          if (!sender.includes(modalSenderQuery)) return false;
-        }
-
-        return true;
-      });
-
-      const selectedCount = modalItems.filter((it) => it.selected).length;
-      const visibleSelectedCount = filteredList.filter((it) => it.selected).length;
-      const allVisibleSelected = filteredList.length > 0 && visibleSelectedCount === filteredList.length;
-
-      const totalCount = modalItems.length;
-      const newCount = totalCount - initialDupeCount;
-      const dateRangeLabel = CONFIG.startDate || CONFIG.endDate
-        ? `${CONFIG.startDate || "Earliest"} → ${CONFIG.endDate || "Today"}`
-        : "All Visible Dates";
-      const cleanSub = cleanSubfolderName(CONFIG.subfolder);
-
+    function renderModalFrame() {
       overlay.innerHTML = `
         <div class="idlc-modal-card">
           <div class="idlc-modal-header">
@@ -929,16 +900,16 @@
               <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
               <span>Review & Select Attachments to Download</span>
             </div>
-            <button id="idlc-modal-close" class="idlc-toast-close">✕</button>
+            <button id="idlc-modal-close" class="idlc-toast-close" title="Close (Esc)">✕</button>
           </div>
 
           <div class="idlc-modal-body">
             <!-- Format Choice: ZIP Archive vs Individual Files -->
             <div class="idlc-format-choice">
-              <div class="idlc-format-opt ${!chosenFormatIsZip ? "idlc-format-active" : ""}" data-format="individual">
+              <div id="idlc-format-opt-indiv" class="idlc-format-opt ${!chosenFormatIsZip ? "idlc-format-active" : ""}" data-format="individual">
                 📁 Individual Files (to ${escapeHtml(cleanSub)}/)
               </div>
-              <div class="idlc-format-opt ${chosenFormatIsZip ? "idlc-format-active" : ""}" data-format="zip">
+              <div id="idlc-format-opt-zip" class="idlc-format-opt ${chosenFormatIsZip ? "idlc-format-active" : ""}" data-format="zip">
                 📦 Single .ZIP Archive (Bundles all into 1 file)
               </div>
             </div>
@@ -947,11 +918,11 @@
             <div class="idlc-summary-box">
               <div class="idlc-summary-item">
                 <span class="idlc-summary-label">Total Files Detected</span>
-                <span class="idlc-summary-val">${totalCount} files (${newCount} new, ${initialDupeCount} saved)</span>
+                <span id="idlc-summary-total-val" class="idlc-summary-val">${totalCount} files (checking duplicates...)</span>
               </div>
               <div class="idlc-summary-item">
                 <span class="idlc-summary-label">Output Mode</span>
-                <span class="idlc-summary-val" style="color:var(--idlc-primary);">
+                <span id="idlc-summary-mode-val" class="idlc-summary-val" style="color:var(--idlc-primary);">
                   ${chosenFormatIsZip ? "📦 Bundled .ZIP Archive" : "📁 Individual Files"}
                 </span>
               </div>
@@ -965,194 +936,221 @@
               </div>
             </div>
 
-            <!-- Search Filters -->
+            <!-- Search Filters Toolbar -->
             <div class="idlc-modal-toolbar">
               <div class="idlc-modal-search-row">
                 <div class="idlc-modal-search-box">
                   <svg class="idlc-modal-search-icon" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-                  <input id="idlc-modal-search-input" type="text" placeholder="Search filename, date, or subject..." value="${escapeHtml(modalSearchQuery)}">
+                  <input id="idlc-modal-search-input" type="text" placeholder="Search filename, date, or subject..." autocomplete="off" spellcheck="false">
+                  <button id="idlc-modal-search-clear" class="idlc-modal-search-clear idlc-hidden" title="Clear search">✕</button>
                 </div>
                 <div class="idlc-modal-search-box">
                   <svg class="idlc-modal-search-icon" viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>
-                  <input id="idlc-modal-sender-input" type="text" placeholder="Filter by sender (e.g. idlc)..." value="${escapeHtml(modalSenderQuery)}">
+                  <input id="idlc-modal-sender-input" type="text" placeholder="Filter by sender (e.g. idlc)..." autocomplete="off" spellcheck="false">
+                  <button id="idlc-modal-sender-clear" class="idlc-modal-search-clear idlc-hidden" title="Clear sender filter">✕</button>
                 </div>
               </div>
 
               <div class="idlc-modal-filter-chips">
-                <button class="idlc-preset-btn ${activeFilterCategory === "all" ? "idlc-active-tab" : ""}" data-tab="all">All (${totalCount})</button>
-                <button class="idlc-preset-btn ${activeFilterCategory === "new" ? "idlc-active-tab" : ""}" data-tab="new">✨ New Only (${newCount})</button>
-                <button class="idlc-preset-btn ${activeFilterCategory === "pdf" ? "idlc-active-tab" : ""}" data-tab="pdf">📄 PDFs</button>
-                <button class="idlc-preset-btn ${activeFilterCategory === "excel" ? "idlc-active-tab" : ""}" data-tab="excel">📊 Excel / CSV</button>
-                ${initialDupeCount > 0 ? `<button class="idlc-preset-btn ${activeFilterCategory === "dupe" ? "idlc-active-tab" : ""}" data-tab="dupe">⚠️ Duplicates (${initialDupeCount})</button>` : ""}
+                <button class="idlc-preset-btn idlc-active-tab" data-tab="all">All (${totalCount})</button>
+                <button class="idlc-preset-btn" data-tab="new">✨ New Only (<span id="idlc-count-new">-</span>)</button>
+                <button class="idlc-preset-btn" data-tab="pdf">📄 PDFs</button>
+                <button class="idlc-preset-btn" data-tab="excel">📊 Excel / CSV</button>
+                <button id="idlc-chip-dupe" class="idlc-preset-btn idlc-hidden" data-tab="dupe">⚠️ Duplicates (<span id="idlc-count-dupe">0</span>)</button>
               </div>
 
               <!-- Master Select Bar -->
               <div class="idlc-select-bar">
                 <label class="idlc-select-left">
-                  <input id="idlc-modal-select-all" type="checkbox" ${allVisibleSelected ? "checked" : ""}>
-                  <span>Select All Visible (${filteredList.length})</span>
+                  <input id="idlc-modal-select-all" type="checkbox" checked>
+                  <span id="idlc-label-select-visible">Select All Visible (${totalCount})</span>
                 </label>
                 <div class="idlc-select-actions">
-                  <button id="idlc-action-select-new" class="idlc-select-btn-link">Select New Only</button>
-                  <button id="idlc-action-deselect-all" class="idlc-select-btn-link">Deselect All</button>
+                  <button id="idlc-action-select-new" class="idlc-select-btn-link" type="button">Select New Only</button>
+                  <button id="idlc-action-deselect-all" class="idlc-select-btn-link" type="button">Deselect All</button>
                 </div>
               </div>
             </div>
 
-            <!-- Scrollable File Preview with Checkboxes, Sender, and Subject -->
+            <!-- Scrollable File Preview with Fixed Height -->
             <div class="idlc-preview-container">
-              <ul class="idlc-preview-list">
-                ${filteredList.length === 0
-                  ? `<li style="padding:16px; text-align:center; color:#5f6368; justify-content:center;">No files match your search filter.</li>`
-                  : filteredList
-                      .map(
-                        (item) => `
-                    <li class="${item.selected ? "idlc-item-selected" : ""}" data-id="${item.id}">
-                      <div class="idlc-preview-left">
-                        <input type="checkbox" class="idlc-item-checkbox" data-id="${item.id}" ${item.selected ? "checked" : ""}>
-                        <div class="idlc-preview-col">
-                          <span class="idlc-preview-file" title="${escapeHtml(item.subpath)}">${escapeHtml(item.originalFilename)}</span>
-                          <span class="idlc-preview-subline" title="${escapeHtml(item.sender)} - ${escapeHtml(item.subject)}">
-                            ✉️ ${escapeHtml(item.sender)} • ${escapeHtml(item.subject)}
-                          </span>
-                        </div>
-                      </div>
-                      <div class="idlc-preview-right">
-                        <span class="idlc-preview-date">${escapeHtml(item.date)}</span>
-                        <span class="idlc-badge-tag ${item.isDupe ? "idlc-badge-dupe" : "idlc-badge-new"}">
-                          ${item.isDupe ? "Saved" : "New"}
-                        </span>
-                      </div>
-                    </li>
-                  `
-                      )
-                      .join("")}
+              <ul id="idlc-preview-list" class="idlc-preview-list">
+                ${getSkeletonRowsHtml(4)}
               </ul>
             </div>
           </div>
 
           <div class="idlc-modal-footer">
             <span style="font-size:12px; color:var(--idlc-secondary-text); font-weight:500;">
-              Selected: <b style="color:var(--idlc-primary);">${selectedCount}</b> of ${totalCount} files
+              Selected: <b id="idlc-selected-count-label" style="color:var(--idlc-primary);">0</b> of ${totalCount} files
             </span>
             <div style="display:flex; gap:10px;">
-              <button id="idlc-modal-cancel" class="idlc-btn-sm idlc-btn-secondary">Cancel</button>
-              <button id="idlc-modal-confirm" class="idlc-btn-sm idlc-btn-primary" ${selectedCount === 0 ? "disabled" : ""}>
-                ${chosenFormatIsZip ? `Download as .ZIP (${selectedCount} files)` : `Download (${selectedCount} files)`}
+              <button id="idlc-modal-cancel" class="idlc-btn-sm idlc-btn-secondary" type="button">Cancel</button>
+              <button id="idlc-modal-confirm" class="idlc-btn-sm idlc-btn-primary" type="button" disabled>
+                Download (${totalCount} files)
               </button>
             </div>
           </div>
         </div>
       `;
-
-      bindModalEvents();
     }
 
-    function bindModalEvents() {
-      const closeModal = () => overlay.classList.add("idlc-hidden");
-      document.getElementById("idlc-modal-close").addEventListener("click", closeModal);
-      document.getElementById("idlc-modal-cancel").addEventListener("click", closeModal);
+    renderModalFrame();
+    overlay.classList.remove("idlc-hidden");
 
-      // Format Choice Toggle
-      overlay.querySelectorAll("[data-format]").forEach((btn) => {
-        btn.addEventListener("click", (e) => {
-          const fmt = e.currentTarget.getAttribute("data-format");
-          chosenFormatIsZip = fmt === "zip";
-          renderModalContent();
-        });
+    // Close logic
+    const closeModal = () => {
+      overlay.classList.add("idlc-hidden");
+      window.removeEventListener("keydown", onKeyDown);
+    };
+
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") {
+        closeModal();
+      } else if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.altKey) {
+        const activeEl = document.activeElement;
+        if (activeEl && (activeEl.id === "idlc-modal-cancel" || activeEl.id === "idlc-modal-close")) {
+          return;
+        }
+        const confirmBtn = document.getElementById("idlc-modal-confirm");
+        if (confirmBtn && !confirmBtn.disabled) {
+          confirmBtn.click();
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+
+    document.getElementById("idlc-modal-close").addEventListener("click", closeModal);
+    document.getElementById("idlc-modal-cancel").addEventListener("click", closeModal);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) closeModal();
+    });
+
+    // Format choices
+    const indivBtn = document.getElementById("idlc-format-opt-indiv");
+    const zipBtn = document.getElementById("idlc-format-opt-zip");
+    const modeVal = document.getElementById("idlc-summary-mode-val");
+
+    if (indivBtn && zipBtn) {
+      indivBtn.addEventListener("click", () => {
+        chosenFormatIsZip = false;
+        indivBtn.classList.add("idlc-format-active");
+        zipBtn.classList.remove("idlc-format-active");
+        if (modeVal) modeVal.textContent = "📁 Individual Files";
+        updateSelectionStateOnly();
       });
-
-      // Search Inputs
-      const searchInput = document.getElementById("idlc-modal-search-input");
-      if (searchInput) {
-        searchInput.addEventListener("input", (e) => {
-          modalSearchQuery = e.target.value.trim().toLowerCase();
-          renderModalContent();
-          const el = document.getElementById("idlc-modal-search-input");
-          if (el) { el.focus(); el.setSelectionRange(modalSearchQuery.length, modalSearchQuery.length); }
-        });
-      }
-
-      const senderInput = document.getElementById("idlc-modal-sender-input");
-      if (senderInput) {
-        senderInput.addEventListener("input", (e) => {
-          modalSenderQuery = e.target.value.trim().toLowerCase();
-          renderModalContent();
-          const el = document.getElementById("idlc-modal-sender-input");
-          if (el) { el.focus(); el.setSelectionRange(modalSenderQuery.length, modalSenderQuery.length); }
-        });
-      }
-
-      // Filter Tabs
-      overlay.querySelectorAll("[data-tab]").forEach((btn) => {
-        btn.addEventListener("click", (e) => {
-          activeFilterCategory = e.target.getAttribute("data-tab");
-          renderModalContent();
-        });
+      zipBtn.addEventListener("click", () => {
+        chosenFormatIsZip = true;
+        zipBtn.classList.add("idlc-format-active");
+        indivBtn.classList.remove("idlc-format-active");
+        if (modeVal) modeVal.textContent = "📦 Bundled .ZIP Archive";
+        updateSelectionStateOnly();
       });
+    }
 
-      // Master Select All
-      const selectAllCb = document.getElementById("idlc-modal-select-all");
-      if (selectAllCb) {
-        selectAllCb.addEventListener("change", (e) => {
-          const checked = e.target.checked;
-          const currentFiltered = getCurrentFiltered();
-          currentFiltered.forEach((it) => (it.selected = checked));
-          renderModalContent();
-        });
-      }
+    // Search input listeners with debouncing and shimmer skeleton
+    const searchInput = document.getElementById("idlc-modal-search-input");
+    const searchClear = document.getElementById("idlc-modal-search-clear");
+    const senderInput = document.getElementById("idlc-modal-sender-input");
+    const senderClear = document.getElementById("idlc-modal-sender-clear");
 
-      const selectNewBtn = document.getElementById("idlc-action-select-new");
-      if (selectNewBtn) {
-        selectNewBtn.addEventListener("click", () => {
-          modalItems.forEach((it) => (it.selected = !it.isDupe));
-          renderModalContent();
-        });
-      }
+    const onSearchChange = () => {
+      const sVal = searchInput ? searchInput.value.trim().toLowerCase() : "";
+      const sndVal = senderInput ? senderInput.value.trim().toLowerCase() : "";
 
-      const deselectAllBtn = document.getElementById("idlc-action-deselect-all");
-      if (deselectAllBtn) {
-        deselectAllBtn.addEventListener("click", () => {
-          modalItems.forEach((it) => (it.selected = false));
-          renderModalContent();
-        });
-      }
+      if (searchClear) searchClear.classList.toggle("idlc-hidden", !sVal);
+      if (senderClear) senderClear.classList.toggle("idlc-hidden", !sndVal);
 
-      // Item Checkbox & Row click
-      overlay.querySelectorAll(".idlc-preview-list li[data-id]").forEach((li) => {
-        li.addEventListener("click", (e) => {
-          if (e.target.tagName.toLowerCase() === "input") return;
-          const id = parseInt(li.getAttribute("data-id"), 10);
-          const item = modalItems.find((it) => it.id === id);
-          if (item) {
-            item.selected = !item.selected;
-            renderModalContent();
-          }
-        });
+      // Show immediate skeleton to indicate filtering without layout shift
+      updateFilteredList(true);
+
+      if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = setTimeout(() => {
+        modalSearchQuery = sVal;
+        modalSenderQuery = sndVal;
+        updateFilteredList(false);
+      }, 130);
+    };
+
+    if (searchInput) {
+      searchInput.addEventListener("input", onSearchChange);
+    }
+    if (senderInput) {
+      senderInput.addEventListener("input", onSearchChange);
+    }
+
+    if (searchClear) {
+      searchClear.addEventListener("click", () => {
+        if (searchInput) searchInput.value = "";
+        searchClear.classList.add("idlc-hidden");
+        modalSearchQuery = "";
+        updateFilteredList(false);
+        if (searchInput) searchInput.focus();
       });
+    }
 
-      overlay.querySelectorAll(".idlc-item-checkbox").forEach((cb) => {
-        cb.addEventListener("change", (e) => {
-          const id = parseInt(e.target.getAttribute("data-id"), 10);
-          const item = modalItems.find((it) => it.id === id);
-          if (item) {
-            item.selected = e.target.checked;
-            renderModalContent();
-          }
-        });
+    if (senderClear) {
+      senderClear.addEventListener("click", () => {
+        if (senderInput) senderInput.value = "";
+        senderClear.classList.add("idlc-hidden");
+        modalSenderQuery = "";
+        updateFilteredList(false);
+        if (senderInput) senderInput.focus();
       });
+    }
 
-      // Confirm button -> begins download queue
-      const confirmBtn = document.getElementById("idlc-modal-confirm");
-      if (confirmBtn) {
-        confirmBtn.addEventListener("click", () => {
-          const selectedItems = modalItems.filter((it) => it.selected);
-          closeModal();
-          if (selectedItems.length > 0) {
-            executeBulkDownload(selectedItems, chosenFormatIsZip);
-          }
+    // Filter Chips
+    overlay.querySelectorAll(".idlc-modal-filter-chips [data-tab]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const tab = e.currentTarget.getAttribute("data-tab");
+        activeFilterCategory = tab;
+        overlay.querySelectorAll(".idlc-modal-filter-chips [data-tab]").forEach((b) => {
+          b.classList.toggle("idlc-active-tab", b.getAttribute("data-tab") === tab);
         });
-      }
+        updateFilteredList(false);
+      });
+    });
+
+    // Master Select / Deselect
+    const selectAllCb = document.getElementById("idlc-modal-select-all");
+    if (selectAllCb) {
+      selectAllCb.addEventListener("change", (e) => {
+        const checked = e.target.checked;
+        const currentFiltered = getCurrentFiltered();
+        currentFiltered.forEach((it) => (it.selected = checked));
+        syncVisibleCheckboxElements();
+        updateSelectionStateOnly();
+      });
+    }
+
+    const selectNewBtn = document.getElementById("idlc-action-select-new");
+    if (selectNewBtn) {
+      selectNewBtn.addEventListener("click", () => {
+        modalItems.forEach((it) => (it.selected = !it.isDupe));
+        syncVisibleCheckboxElements();
+        updateSelectionStateOnly();
+      });
+    }
+
+    const deselectAllBtn = document.getElementById("idlc-action-deselect-all");
+    if (deselectAllBtn) {
+      deselectAllBtn.addEventListener("click", () => {
+        modalItems.forEach((it) => (it.selected = false));
+        syncVisibleCheckboxElements();
+        updateSelectionStateOnly();
+      });
+    }
+
+    // Confirm button
+    const confirmBtn = document.getElementById("idlc-modal-confirm");
+    if (confirmBtn) {
+      confirmBtn.addEventListener("click", () => {
+        const selectedItems = modalItems.filter((it) => it.selected);
+        closeModal();
+        if (selectedItems.length > 0) {
+          executeBulkDownload(selectedItems, chosenFormatIsZip);
+        }
+      });
     }
 
     function getCurrentFiltered() {
@@ -1180,8 +1178,197 @@
       });
     }
 
-    overlay.classList.remove("idlc-hidden");
-    renderModalContent();
+    function syncVisibleCheckboxElements() {
+      const listEl = document.getElementById("idlc-preview-list");
+      if (!listEl) return;
+      listEl.querySelectorAll("li[data-id]").forEach((li) => {
+        const id = parseInt(li.getAttribute("data-id"), 10);
+        const item = modalItems.find((it) => it.id === id);
+        if (item) {
+          li.classList.toggle("idlc-item-selected", item.selected);
+          const cb = li.querySelector(".idlc-item-checkbox");
+          if (cb) cb.checked = item.selected;
+        }
+      });
+    }
+
+    function updateSelectionStateOnly() {
+      const selectedCount = modalItems.filter((it) => it.selected).length;
+      const filteredList = getCurrentFiltered();
+      const visibleSelectedCount = filteredList.filter((it) => it.selected).length;
+      const allVisibleSelected = filteredList.length > 0 && visibleSelectedCount === filteredList.length;
+
+      const selCb = document.getElementById("idlc-modal-select-all");
+      if (selCb) {
+        selCb.checked = allVisibleSelected;
+        selCb.indeterminate = visibleSelectedCount > 0 && visibleSelectedCount < filteredList.length;
+      }
+
+      const selVisibleLabel = document.getElementById("idlc-label-select-visible");
+      if (selVisibleLabel) {
+        selVisibleLabel.textContent = `Select All Visible (${filteredList.length})`;
+      }
+
+      const countLabel = document.getElementById("idlc-selected-count-label");
+      if (countLabel) {
+        countLabel.textContent = selectedCount;
+      }
+
+      const confBtn = document.getElementById("idlc-modal-confirm");
+      if (confBtn) {
+        confBtn.disabled = selectedCount === 0;
+        confBtn.textContent = chosenFormatIsZip
+          ? `Download as .ZIP (${selectedCount} files)`
+          : `Download (${selectedCount} files)`;
+      }
+    }
+
+    function updateFilteredList(showSkeleton = false) {
+      const listEl = document.getElementById("idlc-preview-list");
+      if (!listEl) return;
+
+      if (showSkeleton) {
+        listEl.innerHTML = getSkeletonRowsHtml(4);
+        return;
+      }
+
+      const filteredList = getCurrentFiltered();
+
+      if (filteredList.length === 0) {
+        listEl.innerHTML = `
+          <div class="idlc-empty-state">
+            <svg class="idlc-empty-icon" viewBox="0 0 24 24">
+              <path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>
+            </svg>
+            <div class="idlc-empty-title">No matching attachments found</div>
+            <div class="idlc-empty-desc">No files match your current filename, sender, or category search filter.</div>
+            <button id="idlc-empty-reset" class="idlc-empty-reset-btn" type="button">Reset Filters</button>
+          </div>
+        `;
+
+        const resetBtn = document.getElementById("idlc-empty-reset");
+        if (resetBtn) {
+          resetBtn.addEventListener("click", () => {
+            modalSearchQuery = "";
+            modalSenderQuery = "";
+            activeFilterCategory = "all";
+            if (searchInput) { searchInput.value = ""; }
+            if (senderInput) { senderInput.value = ""; }
+            if (searchClear) searchClear.classList.add("idlc-hidden");
+            if (senderClear) senderClear.classList.add("idlc-hidden");
+            overlay.querySelectorAll(".idlc-modal-filter-chips [data-tab]").forEach((btn) => {
+              btn.classList.toggle("idlc-active-tab", btn.getAttribute("data-tab") === "all");
+            });
+            updateFilteredList(false);
+          });
+        }
+      } else {
+        listEl.innerHTML = filteredList
+          .map(
+            (item) => `
+            <li class="${item.selected ? "idlc-item-selected" : ""}" data-id="${item.id}">
+              <div class="idlc-preview-left">
+                <input type="checkbox" class="idlc-item-checkbox" data-id="${item.id}" ${item.selected ? "checked" : ""}>
+                <div class="idlc-preview-col">
+                  <span class="idlc-preview-file" title="${escapeHtml(item.subpath)}">${escapeHtml(item.originalFilename)}</span>
+                  <span class="idlc-preview-subline" title="${escapeHtml(item.sender)} - ${escapeHtml(item.subject)}">
+                    ✉️ ${escapeHtml(item.sender)} • ${escapeHtml(item.subject)}
+                  </span>
+                </div>
+              </div>
+              <div class="idlc-preview-right">
+                <span class="idlc-preview-date">${escapeHtml(item.date)}</span>
+                <span class="idlc-badge-tag ${item.isDupe ? "idlc-badge-dupe" : "idlc-badge-new"}">
+                  ${item.isDupe ? "Saved" : "New"}
+                </span>
+              </div>
+            </li>
+          `
+          )
+          .join("");
+
+        // Bind item click & checkbox listeners
+        listEl.querySelectorAll("li[data-id]").forEach((li) => {
+          li.addEventListener("click", (e) => {
+            if (e.target.tagName.toLowerCase() === "input") return;
+            const id = parseInt(li.getAttribute("data-id"), 10);
+            const item = modalItems.find((it) => it.id === id);
+            if (item) {
+              item.selected = !item.selected;
+              li.classList.toggle("idlc-item-selected", item.selected);
+              const cb = li.querySelector(".idlc-item-checkbox");
+              if (cb) cb.checked = item.selected;
+              updateSelectionStateOnly();
+            }
+          });
+        });
+
+        listEl.querySelectorAll(".idlc-item-checkbox").forEach((cb) => {
+          cb.addEventListener("change", (e) => {
+            const id = parseInt(e.target.getAttribute("data-id"), 10);
+            const item = modalItems.find((it) => it.id === id);
+            if (item) {
+              item.selected = e.target.checked;
+              const li = cb.closest("li");
+              if (li) li.classList.toggle("idlc-item-selected", item.selected);
+              updateSelectionStateOnly();
+            }
+          });
+        });
+      }
+
+      updateSelectionStateOnly();
+    }
+
+    // Asynchronously resolve duplicates in parallel while skeleton placeholder is visible
+    const dateCounts = {};
+    const dupePromises = rawItems.map(async (item, i) => {
+      const baseDate = item.date;
+      dateCounts[baseDate] = (dateCounts[baseDate] || 0) + 1;
+      const countForDate = dateCounts[baseDate];
+      const datePrefix = countForDate > 1 ? `${baseDate}_(${countForDate})` : baseDate;
+
+      const finalName = CONFIG.prefixDate
+        ? `${datePrefix}_${item.originalFilename}`
+        : item.originalFilename;
+
+      const subpath = cleanSub
+        ? `${cleanSub}/${finalName}`
+        : finalName;
+
+      const isDupe = CONFIG.skipDuplicates ? await isDuplicateFile(subpath, item.downloadUrl) : false;
+
+      return {
+        id: i,
+        ...item,
+        subpath,
+        isDupe,
+        selected: !isDupe || !CONFIG.skipDuplicates
+      };
+    });
+
+    modalItems = await Promise.all(dupePromises);
+    initialDupeCount = modalItems.filter((it) => it.isDupe).length;
+    const newCount = totalCount - initialDupeCount;
+
+    // Update summary values and duplicate chip
+    const totalSummaryVal = document.getElementById("idlc-summary-total-val");
+    if (totalSummaryVal) {
+      totalSummaryVal.textContent = `${totalCount} files (${newCount} new, ${initialDupeCount} saved)`;
+    }
+    const newCountSpan = document.getElementById("idlc-count-new");
+    if (newCountSpan) newCountSpan.textContent = newCount;
+
+    const dupeChip = document.getElementById("idlc-chip-dupe");
+    const dupeCountSpan = document.getElementById("idlc-count-dupe");
+    if (dupeChip && dupeCountSpan) {
+      dupeCountSpan.textContent = initialDupeCount;
+      if (initialDupeCount > 0) dupeChip.classList.remove("idlc-hidden");
+      else dupeChip.classList.add("idlc-hidden");
+    }
+
+    // Populate initial items
+    updateFilteredList(false);
   }
 
   /**
@@ -1910,6 +2097,10 @@
       if (!document.getElementById("idlc-fab-container")) {
         injectUI();
       }
+      const modal = document.getElementById("idlc-modal-overlay");
+      if (modal && !modal.classList.contains("idlc-hidden")) return;
+      if (isDownloading) return;
+
       updateUI();
     }, 350);
   });
